@@ -1,18 +1,22 @@
+import os
 import streamlit as st
 import oracledb
+from dotenv import load_dotenv
 from neo4j import GraphDatabase
 import pandas as pd
 from datetime import datetime, timedelta
 
+load_dotenv()
+
 # --- 1. CẤU HÌNH KẾT NỐI ---
 oracle_config = {
-    "user": "LIBRARY_DB",
-    "password": "123456",
-    "dsn": "localhost:1521/freepdb1"
+    "user": os.getenv("ORACLE_USER"),
+    "password": os.getenv("ORACLE_PASSWORD"),
+    "dsn": os.getenv("ORACLE_DSN")
 }
 
-neo4j_uri = "neo4j+ssc://3e3c2d19.databases.neo4j.io"
-neo4j_auth = ("neo4j", "U8oMxh20Z0-W_y4SNkGlC2-2Noy334P8ImOJhp-OIKw")
+neo4j_uri = os.getenv("NEO4J_URI")
+neo4j_auth = (os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD"))
 ADMIN_SECRET_KEY = "BK_LIBRARY_2026" 
 
 # --- 2. HÀM LOGIC BACKEND ---
