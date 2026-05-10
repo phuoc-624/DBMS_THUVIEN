@@ -1,9 +1,9 @@
 import os
 import streamlit as st
 import oracledb
-from dotenv import load_dotenv
 from neo4j import GraphDatabase
-import pandas as pd
+from dotenv import load_dotenv
+#import pandas as pd
 from datetime import datetime, timedelta
 
 load_dotenv()
@@ -17,7 +17,12 @@ oracle_config = {
 
 neo4j_uri = os.getenv("NEO4J_URI")
 neo4j_auth = (os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD"))
-ADMIN_SECRET_KEY = "BK_LIBRARY_2026" 
+ADMIN_SECRET_KEY = "BK_LIBRARY_2026"
+PAGE_SIZE_DEFAULT = 10
+PAGE_SIZE_SEARCH_ALL = 50
+PAGE_SIZE_USER = 20
+PAGE_SIZE_LOAN = 20
+PAGE_SIZE_HISTORY = 10
 
 # --- 2. HÀM LOGIC BACKEND ---
 @st.cache_resource
@@ -69,6 +74,8 @@ def execute_oracle(sql, params=None, is_select=True):
     try:
         conn = oracledb.connect(**oracle_config)
         cursor = conn.cursor()
+        cursor.arraysize = 500
+        cursor.prefetchrows = 500
         if params:
             cursor.execute(sql, params)
         else:
@@ -110,6 +117,179 @@ def get_next_id(table, col, prefix):
         number_part = int(current_max[len(prefix):])
         return f"{prefix}{number_part + 1:03d}"
     return f"{prefix}001"
+
+
+def query_books_page(page=1, page_size=PAGE_SIZE_DEFAULT, ma_sach=None, ten_sach=None,
+                     nam_xb=None, the_loai=None, tac_gia=None, tinh_trang="Tất cả"):
+    base_sql = """
+        SELECT s.MA_SACH, s.TEN_SACH, t.TEN_THE_LOAI,
+               LISTAGG(tg.TEN_TG, ', ') WITHIN GROUP (ORDER BY tg.TEN_TG) AS TAC_GIA,
+               s.NAM_XB, s.SO_LUONG
+        FROM SACH s
+        JOIN THE_LOAI t ON s.MA_THE_LOAI = t.MA_THE_LOAI
+        LEFT JOIN SACH_TAC_GIA stg ON s.MA_SACH = stg.MA_SACH
+        LEFT JOIN TAC_GIA tg ON stg.MA_TG = tg.MA_TG
+        WHERE 1=1
+    """
+    params = {}
+
+    if ma_sach:
+        base_sql += " AND s.MA_SACH = :ma_sach"
+        params["ma_sach"] = ma_sach
+    if ten_sach:
+        base_sql += " AND UPPER(s.TEN_SACH) LIKE UPPER(:ten_sach)"
+        params["ten_sach"] = f"%{ten_sach}%"
+    if nam_xb:
+        base_sql += " AND s.NAM_XB = :nam_xb"
+        params["nam_xb"] = nam_xb
+    if the_loai:
+        base_sql += " AND UPPER(t.TEN_THE_LOAI) LIKE UPPER(:the_loai)"
+        params["the_loai"] = f"%{the_loai}%"
+    if tac_gia:
+        base_sql += " AND UPPER(tg.TEN_TG) LIKE UPPER(:tac_gia)"
+        params["tac_gia"] = f"%{tac_gia}%"
+
+    if tinh_trang == "Còn hàng":
+        base_sql += " AND s.SO_LUONG > 0"
+    elif tinh_trang == "Hết hàng":
+        base_sql += " AND s.SO_LUONG = 0"
+
+    base_sql += " GROUP BY s.MA_SACH, s.TEN_SACH, t.TEN_THE_LOAI, s.NAM_XB, s.SO_LUONG"
+    base_sql += " ORDER BY s.MA_SACH"
+
+    offset = (page - 1) * page_size
+    paginated_sql = base_sql + f" OFFSET {offset} ROWS FETCH NEXT {page_size + 1} ROWS ONLY"
+
+    rows, _ = execute_oracle(paginated_sql, params)
+    if rows is None:
+        return [], False
+
+    has_more = len(rows) > page_size
+    return rows[:page_size], has_more
+
+
+def query_users_page(page=1, page_size=PAGE_SIZE_USER, search_term=None, status_option="Tất cả"):
+    base_sql = "SELECT MA_DG, USERNAME, HO_TEN, SO_DIEN_THOAI, TRANG_THAI FROM NGUOI_DUNG WHERE 1=1"
+    params = []
+
+    if status_option == "Hoạt động":
+        base_sql += " AND TRANG_THAI = 1"
+    elif status_option == "Đã khóa":
+        base_sql += " AND TRANG_THAI = 0"
+
+    if search_term:
+        base_sql += " AND (UPPER(HO_TEN) LIKE UPPER(:1) OR SO_DIEN_THOAI LIKE :2 OR MA_DG = :3 OR UPPER(USERNAME) LIKE UPPER(:4))"
+        search_val = f"%{search_term}%"
+        params = [search_val, search_val, search_term, search_val]
+
+    base_sql += " ORDER BY MA_DG"
+    offset = (page - 1) * page_size
+    paginated_sql = base_sql + f" OFFSET {offset} ROWS FETCH NEXT {page_size + 1} ROWS ONLY"
+
+    rows, _ = execute_oracle(paginated_sql, params)
+    if rows is None:
+        return [], False
+
+    has_more = len(rows) > page_size
+    return rows[:page_size], has_more
+
+
+def query_loans_page(page=1, page_size=PAGE_SIZE_LOAN, search_kw=None, status_filter="Tất cả", overdue_filter=False, date_m=None, date_h=None):
+    base_sql = """
+        SELECT pm.MA_PM, nd.MA_DG, nd.HO_TEN, s.TEN_SACH, pm.SO_LUONG_MUON,
+               pm.NGAY_MUON, pm.NGAY_TRA_DU_KIEN, pm.TRANG_THAI, s.MA_SACH
+        FROM PHIEU_MUON pm
+        JOIN NGUOI_DUNG nd ON pm.MA_DG = nd.MA_DG
+        JOIN SACH s ON pm.MA_SACH = s.MA_SACH
+        WHERE pm.TRANG_THAI != 'Chờ duyệt'
+    """
+    params = []
+
+    if search_kw:
+        base_sql += " AND (UPPER(nd.HO_TEN) LIKE UPPER(:1) OR UPPER(s.TEN_SACH) LIKE UPPER(:2) OR nd.MA_DG = :3)"
+        params += [f"%{search_kw}%", f"%{search_kw}%", search_kw]
+
+    if status_filter != "Tất cả":
+        base_sql += f" AND pm.TRANG_THAI = :{len(params)+1}"
+        params.append(status_filter)
+
+    if overdue_filter:
+        base_sql += " AND pm.NGAY_TRA_DU_KIEN < SYSDATE AND pm.TRANG_THAI = 'Đang mượn'"
+
+    if date_m:
+        base_sql += f" AND TRUNC(pm.NGAY_MUON) = :{len(params)+1}"
+        params.append(date_m)
+
+    if date_h:
+        base_sql += f" AND TRUNC(pm.NGAY_TRA_DU_KIEN) = :{len(params)+1}"
+        params.append(date_h)
+
+    base_sql += " ORDER BY pm.NGAY_TRA_DU_KIEN ASC"
+    offset = (page - 1) * page_size
+    paginated_sql = base_sql + f" OFFSET {offset} ROWS FETCH NEXT {page_size + 1} ROWS ONLY"
+
+    rows, _ = execute_oracle(paginated_sql, params)
+    if rows is None:
+        return [], False
+
+    has_more = len(rows) > page_size
+    return rows[:page_size], has_more
+
+
+def query_user_history_page(page=1, page_size=PAGE_SIZE_HISTORY, ma_dg=None, search_book=None, status_filter="Tất cả", date_m=None, date_h=None):
+    base_sql = """
+        SELECT pm.MA_PM, s.TEN_SACH, pm.SO_LUONG_MUON,
+               pm.NGAY_MUON, pm.NGAY_TRA_DU_KIEN, pm.TRANG_THAI
+        FROM PHIEU_MUON pm
+        JOIN SACH s ON pm.MA_SACH = s.MA_SACH
+        WHERE pm.MA_DG = :1
+    """
+    params = [ma_dg]
+
+    if search_book:
+        base_sql += f" AND UPPER(s.TEN_SACH) LIKE UPPER(:{len(params)+1})"
+        params.append(f"%{search_book}%")
+
+    if status_filter != "Tất cả":
+        base_sql += f" AND pm.TRANG_THAI = :{len(params)+1}"
+        params.append(status_filter)
+
+    if date_m:
+        base_sql += f" AND TRUNC(pm.NGAY_MUON) = :{len(params)+1}"
+        params.append(date_m)
+
+    if date_h:
+        base_sql += f" AND TRUNC(pm.NGAY_TRA_DU_KIEN) = :{len(params)+1}"
+        params.append(date_h)
+
+    base_sql += " ORDER BY pm.NGAY_MUON DESC"
+    offset = (page - 1) * page_size
+    paginated_sql = base_sql + f" OFFSET {offset} ROWS FETCH NEXT {page_size + 1} ROWS ONLY"
+
+    rows, _ = execute_oracle(paginated_sql, params)
+    if rows is None:
+        return [], False
+
+    has_more = len(rows) > page_size
+    return rows[:page_size], has_more
+
+
+def render_book_page(rows, page, has_more, prefix="catalog", state_key=None):
+    if not rows:
+        st.info("Không có kết quả phù hợp.")
+        return
+
+    display_book_grid(rows, prefix=prefix)
+    col_prev, col_next = st.columns([1, 1])
+    if state_key is None:
+        state_key = f"{prefix}_page"
+
+    if col_prev.button("← Trang trước", key=f"prev_{prefix}", disabled=page <= 1):
+        st.session_state[state_key] = page - 1
+        st.rerun()
+    if col_next.button("Trang sau →", key=f"next_{prefix}", disabled=not has_more):
+        st.session_state[state_key] = page + 1
+        st.rerun()
 
 
 def display_recommendations():
@@ -167,32 +347,18 @@ def display_user_management(search_term=None):
             index=0
         )
 
-    # 2. Xây dựng câu lệnh SQL
-    sql = "SELECT MA_DG, USERNAME, HO_TEN, SO_DIEN_THOAI, TRANG_THAI FROM NGUOI_DUNG WHERE 1=1"
-    params = []
+    if 'admin_user_page' not in st.session_state:
+        st.session_state.admin_user_page = 1
 
-    # Lọc theo trạng thái
-    if status_option == "Hoạt động":
-        sql += " AND TRANG_THAI = 1"
-    elif status_option == "Đã khóa":
-        sql += " AND TRANG_THAI = 0"
+    rows, has_more = query_users_page(
+        page=st.session_state.admin_user_page,
+        page_size=PAGE_SIZE_USER,
+        search_term=search_term,
+        status_option=status_option
+    )
 
-    # Lọc theo từ khóa (Thêm USERNAME vào đây)
-    if search_term:
-        # Tăng số lượng tham số lên 4 (Ho_ten, SDT, Ma_dg, Username)
-        sql += """ AND (
-            UPPER(HO_TEN) LIKE UPPER(:1) 
-            OR SO_DIEN_THOAI LIKE :2 
-            OR MA_DG = :3 
-            OR UPPER(USERNAME) LIKE UPPER(:4)
-        )"""
-        search_val = f"%{search_term}%"
-        params = [search_val, search_val, search_term, search_val]
-    
-    data, _ = execute_oracle(sql, params)
-    
-    # 3. Hiển thị giao diện bảng
-    if data:
+    if rows:
+        st.write(f"Hiển thị trang **{st.session_state.admin_user_page}** với **{len(rows)}** tài khoản")
         cols = st.columns([1, 1.5, 2, 1.5, 1.2, 1.2])
         headers = ["Mã ĐG", "Username", "Họ Tên", "SĐT", "Trạng Thái", "Thao tác"]
         for col, header in zip(cols, headers):
@@ -200,7 +366,7 @@ def display_user_management(search_term=None):
         
         st.divider()
 
-        for row in data:
+        for row in rows:
             ma_dg, username, ho_ten, sdt, trang_thai = row
             c1, c2, c3, c4, c5, c6 = st.columns([1, 1.5, 2, 1.5, 1.2, 1.2])
             
@@ -219,73 +385,60 @@ def display_user_management(search_term=None):
                 new_status = 0 if trang_thai == 1 else 1
                 update_sql = "UPDATE NGUOI_DUNG SET TRANG_THAI = :1 WHERE MA_DG = :2"
                 execute_oracle(update_sql, [new_status, ma_dg], is_select=False)
+                sync_user_node(ma_dg)
                 
                 st.toast(f"Đã cập nhật trạng thái cho {username}!")
                 st.rerun()
+
+        col_prev, col_next = st.columns([1, 1])
+        if col_prev.button("← Trang trước", key="user_prev", disabled=st.session_state.admin_user_page <= 1):
+            st.session_state.admin_user_page -= 1
+            st.rerun()
+        if col_next.button("Trang sau →", key="user_next", disabled=not has_more):
+            st.session_state.admin_user_page += 1
+            st.rerun()
     else:
         st.info("Không tìm thấy tài khoản phù hợp.")
 
 def display_user_borrow_history():
     st.subheader("📖 Lịch sử mượn sách của bạn")
     
-    # Lấy ID người dùng đang đăng nhập từ session_state
     ma_dg = st.session_state.get("user_id") 
     
     if not ma_dg:
         st.warning("Vui lòng đăng nhập để xem lịch sử.")
         return
 
-    # 1. Bộ lọc dành riêng cho User
+    if 'user_history_page' not in st.session_state:
+        st.session_state.user_history_page = 1
+
     with st.expander("🔍 Tìm kiếm trong lịch sử của bạn", expanded=True):
         f1, f2 = st.columns([2, 1])
         search_book = f1.text_input("Nhập tên sách cần tìm")
-        status_filter = f2.selectbox("Trạng thái", ["Tất cả", "Đang mượn", "Đã trả"], index=0)
+        status_filter = f2.selectbox("Trạng Thái", ["Tất cả", "Đang mượn", "Đã trả"], index=0)
 
         f3, f4 = st.columns(2)
-        # Sử dụng lọc chính xác một ngày (không dùng khoảng)
         date_m = f3.date_input("Lọc theo ngày mượn", value=None)
         date_h = f4.date_input("Lọc theo hạn trả dự kiến", value=None)
 
-    # 2. Xây dựng SQL (Luôn luôn lọc theo MA_DG của user hiện tại)
-    sql = """
-        SELECT pm.MA_PM, s.TEN_SACH, pm.SO_LUONG_MUON, 
-               pm.NGAY_MUON, pm.NGAY_TRA_DU_KIEN, pm.TRANG_THAI
-        FROM PHIEU_MUON pm
-        JOIN SACH s ON pm.MA_SACH = s.MA_SACH
-        WHERE pm.MA_DG = :1
-    """
-    params = [ma_dg]
+    rows, has_more = query_user_history_page(
+        page=st.session_state.user_history_page,
+        page_size=PAGE_SIZE_HISTORY,
+        ma_dg=ma_dg,
+        search_book=search_book,
+        status_filter=status_filter,
+        date_m=date_m,
+        date_h=date_h
+    )
 
-    if search_book:
-        sql += f" AND UPPER(s.TEN_SACH) LIKE UPPER(:{len(params)+1})"
-        params.append(f"%{search_book}%")
-
-    if status_filter != "Tất cả":
-        sql += f" AND pm.TRANG_THAI = :{len(params)+1}"
-        params.append(status_filter)
-
-    # Sửa lỗi lọc ngày bằng TRUNC để bỏ qua giờ/phút/giây
-    if date_m:
-        sql += f" AND TRUNC(pm.NGAY_MUON) = :{len(params)+1}"
-        params.append(date_m)
-        
-    if date_h:
-        sql += f" AND TRUNC(pm.NGAY_TRA_DU_KIEN) = :{len(params)+1}"
-        params.append(date_h)
-
-    sql += " ORDER BY pm.NGAY_MUON DESC" # Sách mới mượn hiện lên đầu
-    
-    data, _ = execute_oracle(sql, params)
-
-    # 3. Hiển thị Grid kết quả
-    if data:
-        st.write(f"Bạn có **{len(data)}** bản ghi mượn sách.")
+    if rows:
+        st.write(f"Hiển thị trang **{st.session_state.user_history_page}** với **{len(rows)}** bản ghi")
         cols = st.columns([1, 2, 0.8, 1.2, 1.2, 1])
         headers = ["Mã PM", "Tên Sách", "SL", "Ngày Mượn", "Hạn Trả", "Trạng Thái"]
         for col, h in zip(cols, headers): col.markdown(f"**{h}**")
         st.divider()
 
-        for row in data:
+        for row in rows:
             ma_pm, ten_sach, sl_muon, ngay_m, ngay_h, status = row
             c1, c2, c3, c4, c5, c6 = st.columns([1, 2, 0.8, 1.2, 1.2, 1])
             
@@ -294,16 +447,22 @@ def display_user_borrow_history():
             c3.text(sl_muon)
             c4.text(ngay_m.strftime('%d/%m/%Y'))
             
-            # Kiểm tra quá hạn để đổi màu cho User biết
             is_overdue = ngay_h < datetime.now() and status == 'Đang mượn'
             h_color = "red" if is_overdue else "black"
             c5.markdown(f"<span style='color:{h_color}'>{ngay_h.strftime('%d/%m/%Y')}</span>", unsafe_allow_html=True)
             
             st_icon = "🔵" if status == "Đang mượn" else "🟢"
             c6.text(f"{st_icon} {status}")
+
+        col_prev, col_next = st.columns([1, 1])
+        if col_prev.button("← Trang trước", key="history_prev", disabled=st.session_state.user_history_page <= 1):
+            st.session_state.user_history_page -= 1
+            st.rerun()
+        if col_next.button("Trang sau →", key="history_next", disabled=not has_more):
+            st.session_state.user_history_page += 1
+            st.rerun()
     else:
         st.info("Lịch sử trống. Hãy mượn cuốn sách đầu tiên của bạn nhé!")
-
 def borrow_book_page():
     st.button("⬅️ Quay lại danh sách", on_click=lambda: st.session_state.update(page="catalog"))
     
@@ -369,6 +528,8 @@ def borrow_book_page():
                         if success_s:
                             st.success(f"🎉 Mượn sách thành công! Mã phiếu của bạn là: **{ma_pm_moi}**")
                             st.session_state.borrow_book_stock -= so_luong_muon
+                            sync_book_node(ma_sach)
+                            sync_borrow_record(ma_pm_moi)
                         else:
                             st.error(f"Lỗi cập nhật kho: {err_s}")
                     else:
@@ -395,51 +556,24 @@ def display_borrow_management():
         date_m = f4.date_input("Lọc chính xác Ngày mượn", value=None)
         date_h = f5.date_input("Lọc chính xác Hạn trả", value=None)
 
-    # 2. Xây dựng câu lệnh SQL
-    sql = """
-        SELECT pm.MA_PM, nd.MA_DG, nd.HO_TEN, s.TEN_SACH, pm.SO_LUONG_MUON,
-               pm.NGAY_MUON, pm.NGAY_TRA_DU_KIEN, pm.TRANG_THAI, s.MA_SACH
-        FROM PHIEU_MUON pm
-        JOIN NGUOI_DUNG nd ON pm.MA_DG = nd.MA_DG
-        JOIN SACH s ON pm.MA_SACH = s.MA_SACH
-        WHERE pm.TRANG_THAI != 'Chờ duyệt'
-    """
-    params = []
+    rows, has_more = query_loans_page(
+        page=st.session_state.admin_loan_page if 'admin_loan_page' in st.session_state else 1,
+        page_size=PAGE_SIZE_LOAN,
+        search_kw=search_kw,
+        status_filter=status_filter,
+        overdue_filter=overdue_filter,
+        date_m=date_m,
+        date_h=date_h
+    )
 
-    # ... (Giữ nguyên các phần lọc Search và Status) ...
-    if search_kw:
-        sql += " AND (UPPER(nd.HO_TEN) LIKE UPPER(:1) OR UPPER(s.TEN_SACH) LIKE UPPER(:2) OR nd.MA_DG = :3)"
-        params += [f"%{search_kw}%", f"%{search_kw}%", search_kw]
-
-    if status_filter != "Tất cả":
-        sql += f" AND pm.TRANG_THAI = :{len(params)+1}"
-        params.append(status_filter)
-
-    if overdue_filter:
-        sql += " AND pm.NGAY_TRA_DU_KIEN < SYSDATE AND pm.TRANG_THAI = 'Đang mượn'"
-
-    # SỬA ĐỔI: Lọc ngày chính xác bằng TRUNC để bỏ qua giờ phút giây
-    if date_m:
-        sql += f" AND TRUNC(pm.NGAY_MUON) = :{len(params)+1}"
-        params.append(date_m)
-
-    if date_h:
-        sql += f" AND TRUNC(pm.NGAY_TRA_DU_KIEN) = :{len(params)+1}"
-        params.append(date_h)
-
-    sql += " ORDER BY pm.NGAY_TRA_DU_KIEN ASC"
-    
-    data, _ = execute_oracle(sql, params)
-    
-    # 3. Hiển thị kết quả
-    if data:
-        st.write(f"Tìm thấy **{len(data)}** bản ghi.")
+    if rows:
+        st.write(f"Hiển thị trang **{st.session_state.admin_loan_page}** với **{len(rows)}** phiếu mượn")
         cols = st.columns([0.7, 1.2, 1.2, 0.5, 1, 1, 0.8, 1])
         headers = ["Mã PM", "Độc Giả", "Tên Sách", "SL", "Ngày Mượn", "Hạn Trả", "Trạng Thái", "Thao tác"]
         for col, h in zip(cols, headers): col.markdown(f"**{h}**")
         st.divider()
 
-        for row in data:
+        for row in rows:
             ma_pm, ma_dg, ho_ten, ten_sach, so_luong_muon, ngay_m, ngay_h, status, ma_sach = row
             c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([0.7, 1.2, 1.2, 0.5, 1, 1, 0.8, 1])
             
@@ -464,6 +598,14 @@ def display_borrow_management():
                     confirm_return(ma_pm, ma_dg, ma_sach)
             else:
                 c8.write("✅ Đã hoàn thành")
+
+        col_prev, col_next = st.columns([1, 1])
+        if col_prev.button("← Trang trước", key="loan_prev", disabled=st.session_state.admin_loan_page <= 1):
+            st.session_state.admin_loan_page -= 1
+            st.rerun()
+        if col_next.button("Trang sau →", key="loan_next", disabled=not has_more):
+            st.session_state.admin_loan_page += 1
+            st.rerun()
     else:
         st.info("Không có dữ liệu mượn trả phù hợp với bộ lọc.")
 
@@ -480,143 +622,70 @@ def confirm_return(ma_pm, ma_dg, ma_sach):
     execute_oracle(sql2, [ma_pm, ma_sach], is_select=False)
     execute_oracle(sql3, [ma_dg], is_select=False)
     
+    sync_borrow_record(ma_pm)
+    sync_user_node(ma_dg)
+    sync_book_node(ma_sach)
+    
     st.success(f"Đã xử lý trả sách cho phiếu {ma_pm}. Tài khoản {ma_dg} đã được mở khóa.")
     st.rerun()
 
-def display_comprehensive_catalog_user():
-    st.subheader("📋 Danh mục sách chi tiết (Oracle)")
-    
-    # Query Join 4 bảng với LISTAGG và thêm cột SO_LUONG
-    # Lưu ý: Phải thêm s.SO_LUONG vào GROUP BY để tránh lỗi SQL
-    sql_query = """
-        SELECT 
-            s.MA_SACH, 
-            s.TEN_SACH, 
-            t.TEN_THE_LOAI, 
-            LISTAGG(tg.TEN_TG, ', ') WITHIN GROUP (ORDER BY tg.TEN_TG) AS TAC_GIA,
-            s.NAM_XB,
-            s.SO_LUONG
-        FROM SACH s
-        JOIN THE_LOAI t ON s.MA_THE_LOAI = t.MA_THE_LOAI
-        LEFT JOIN SACH_TAC_GIA stg ON s.MA_SACH = stg.MA_SACH
-        LEFT JOIN TAC_GIA tg ON stg.MA_TG = tg.MA_TG
-        GROUP BY s.MA_SACH, s.TEN_SACH, t.TEN_THE_LOAI, s.NAM_XB, s.SO_LUONG
-        ORDER BY s.MA_SACH
-    """
-    
-    data, cols = execute_oracle(sql_query)
-    
-    if data:
-        # Thêm cột "Số Lượng" vào danh sách cột của DataFrame
-        #df = pd.DataFrame(data, columns=["Mã Sách", "Tên Sách", "Thể Loại", "Tác Giả", "Năm XB", "Số Lượng"])
-        
-        # Mẹo: Highlight màu đỏ nếu số lượng bằng 0 để Admin dễ nhận biết
-        def highlight_out_of_stock(row):
-            return ['color: red' if row['Số Lượng'] == 0 else '' for _ in row]
-        display_book_grid(data)
-    else:
-        st.info("Thư viện hiện đang trống.")
-
 def display_comprehensive_catalog():
     st.subheader("📋 Danh mục sách chi tiết (Oracle)")
+
+    if 'admin_catalog_page' not in st.session_state:
+        st.session_state.admin_catalog_page = 1
+
+    rows, has_more = query_books_page(page=st.session_state.admin_catalog_page, page_size=PAGE_SIZE_DEFAULT)
     
-    # Query Join 4 bảng với LISTAGG và thêm cột SO_LUONG
-    # Lưu ý: Phải thêm s.SO_LUONG vào GROUP BY để tránh lỗi SQL
-    sql_query = """
-        SELECT 
-            s.MA_SACH, 
-            s.TEN_SACH, 
-            t.TEN_THE_LOAI, 
-            LISTAGG(tg.TEN_TG, ', ') WITHIN GROUP (ORDER BY tg.TEN_TG) AS TAC_GIA,
-            s.NAM_XB,
-            s.SO_LUONG
-        FROM SACH s
-        JOIN THE_LOAI t ON s.MA_THE_LOAI = t.MA_THE_LOAI
-        LEFT JOIN SACH_TAC_GIA stg ON s.MA_SACH = stg.MA_SACH
-        LEFT JOIN TAC_GIA tg ON stg.MA_TG = tg.MA_TG
-        GROUP BY s.MA_SACH, s.TEN_SACH, t.TEN_THE_LOAI, s.NAM_XB, s.SO_LUONG
-        ORDER BY s.MA_SACH
-    """
-    
-    data, cols = execute_oracle(sql_query)
-    
-    if data:
-        # Thêm cột "Số Lượng" vào danh sách cột của DataFrame
-        df = pd.DataFrame(data, columns=["Mã Sách", "Tên Sách", "Thể Loại", "Tác Giả", "Năm XB", "Số Lượng"])
-        
-        # Mẹo: Highlight màu đỏ nếu số lượng bằng 0 để Admin dễ nhận biết
-        def highlight_out_of_stock(row):
-            return ['color: red' if row['Số Lượng'] == 0 else '' for _ in row]
-        st.dataframe(
-            df.style.apply(highlight_out_of_stock, axis=1), 
-            width="stretch", 
-            hide_index=True
-        )
+    if rows:
+        display_book_grid(rows, prefix="admin_catalog", show_borrow_button=False)
+        col_prev, col_next = st.columns([1, 1])
+        if col_prev.button("← Trang trước", key="admin_cat_prev", disabled=st.session_state.admin_catalog_page <= 1):
+            st.session_state.admin_catalog_page -= 1
+            st.rerun()
+        if col_next.button("Trang sau →", key="admin_cat_next", disabled=not has_more):
+            st.session_state.admin_catalog_page += 1
+            st.rerun()
     else:
-        st.info("Thư viện hiện đang trống.")
+        st.info("Chưa có dữ liệu sách.")
 
-def search_books_advanced(ma_sach=None, ten_sach=None, nam_xb=None, the_loai=None, tac_gia=None, tinh_trang="Tất cả"):
-    sql = """
-        SELECT 
-            s.MA_SACH, s.TEN_SACH, t.TEN_THE_LOAI, 
-            LISTAGG(tg.TEN_TG, ', ') WITHIN GROUP (ORDER BY tg.TEN_TG) AS TAC_GIA,
-            s.NAM_XB, s.SO_LUONG
-        FROM SACH s
-        JOIN THE_LOAI t ON s.MA_THE_LOAI = t.MA_THE_LOAI
-        LEFT JOIN SACH_TAC_GIA stg ON s.MA_SACH = stg.MA_SACH
-        LEFT JOIN TAC_GIA tg ON stg.MA_TG = tg.MA_TG
-        WHERE 1=1
-    """
-    params = []
-    
-    # ... (Các điều kiện cũ giữ nguyên) ...
-    if ma_sach:
-        sql += " AND s.MA_SACH = :1"
-        params.append(ma_sach)
-    if ten_sach:
-        sql += " AND UPPER(s.TEN_SACH) LIKE UPPER(:2)"
-        params.append(f"%{ten_sach}%")
-    if nam_xb:
-        sql += " AND s.NAM_XB = :3"
-        params.append(nam_xb)
-    if the_loai:
-        sql += " AND UPPER(t.TEN_THE_LOAI) LIKE UPPER(:4)"
-        params.append(f"%{the_loai}%")
-    if tac_gia:
-        sql += " AND UPPER(tg.TEN_TG) LIKE UPPER(:5)"
-        params.append(f"%{tac_gia}%")
+def is_search_all(filters: dict) -> bool:
+    return (
+        not filters.get("ma_sach")
+        and not filters.get("ten_sach")
+        and not filters.get("nam_xb")
+        and not filters.get("the_loai")
+        and not filters.get("tac_gia")
+        and filters.get("tinh_trang") == "Tất cả"
+    )
 
-    # MỚI: Lọc theo số lượng (Tình trạng kho)
-    if tinh_trang == "Còn hàng":
-        sql += " AND s.SO_LUONG > 0"
-    elif tinh_trang == "Hết hàng":
-        sql += " AND s.SO_LUONG = 0"
-        
-    sql += " GROUP BY s.MA_SACH, s.TEN_SACH, t.TEN_THE_LOAI, s.NAM_XB, s.SO_LUONG"
-    return execute_oracle(sql, params)
+
+def search_books_advanced(ma_sach=None, ten_sach=None, nam_xb=None, the_loai=None, tac_gia=None, tinh_trang="Tất cả", page=1, page_size=PAGE_SIZE_DEFAULT):
+    return query_books_page(page=page, page_size=page_size,
+                            ma_sach=ma_sach, ten_sach=ten_sach,
+                            nam_xb=nam_xb, the_loai=the_loai,
+                            tac_gia=tac_gia, tinh_trang=tinh_trang)
 
 def search_logic():
     st.subheader("🔍 Bộ lọc tìm kiếm")
-    
+
     c1, c2, c3 = st.columns(3)
     with c1:
-        ma = st.text_input("Mã sách", key="search_ma")
+        ma = st.text_input("Mã sách", key="admin_search_ma")
     with c2:
-        ten = st.text_input("Tên sách", key="search_ten")
+        ten = st.text_input("Tên sách", key="admin_search_ten")
     with c3:
-        nam_raw = st.text_input("Năm xuất bản", key="search_nam")
-    
-    c4, c5, c6 = st.columns(3) # Chia làm 3 cột để thêm ô Số lượng
-    with c4:
-        tl = st.text_input("Thể loại", key="search_tl")
-    with c5:
-        tg = st.text_input("Tác giả", key="search_tg")
-    with c6:
-        # Thay vì nhập số, ta chọn trạng thái kho sẽ tiện hơn cho Admin/User
-        tinh_trang = st.selectbox("Tình trạng kho", ["Tất cả", "Còn hàng", "Hết hàng"])
+        nam_raw = st.text_input("Năm xuất bản", key="admin_search_nam")
 
-    if st.button("Bắt đầu tìm", width="stretch"):
-        # VALIDATION Năm
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        tl = st.text_input("Thể loại", key="admin_search_tl")
+    with c5:
+        tg = st.text_input("Tác giả", key="admin_search_tg")
+    with c6:
+        tinh_trang = st.selectbox("Tình trạng kho", ["Tất cả", "Còn hàng", "Hết hàng"], key="admin_search_tinh_trang")
+
+    if st.button("Bắt đầu tìm", width="stretch", key="admin_search_button"):
         valid = True
         n_val = None
         if nam_raw:
@@ -626,20 +695,46 @@ def search_logic():
                     st.error(f"❌ Năm '{nam_raw}' không hợp lệ (0-2026)")
                     valid = False
             except ValueError:
-                st.error(f"❌ Năm phải là số nguyên!")
+                st.error("❌ Năm phải là số nguyên!")
                 valid = False
 
         if valid:
-            res, _ = search_books_advanced(ma, ten, n_val, tl, tg, tinh_trang)
-            if res:
-                df = pd.DataFrame(res, columns=["Mã", "Tên Sách", "Thể Loại", "Tác Giả", "Năm", "Số Lượng"])
-                st.dataframe(df, width="stretch", hide_index=True)
-            else:
-                st.info("⚠️ Không tìm thấy kết quả phù hợp.")
+            st.session_state.admin_search_filters = {
+                "ma_sach": ma or None,
+                "ten_sach": ten or None,
+                "nam_xb": n_val,
+                "the_loai": tl or None,
+                "tac_gia": tg or None,
+                "tinh_trang": tinh_trang,
+            }
+            st.session_state.admin_search_page = 1
+            st.rerun()
+
+    if st.session_state.get("admin_search_filters"):
+        filters = st.session_state.admin_search_filters
+        st.subheader("🎯 Kết quả tìm kiếm phù hợp")
+        page = st.session_state.get("admin_search_page", 1)
+        page_size = PAGE_SIZE_SEARCH_ALL if is_search_all(filters) else PAGE_SIZE_DEFAULT
+        rows, has_more = search_books_advanced(
+            ma_sach=filters["ma_sach"],
+            ten_sach=filters["ten_sach"],
+            nam_xb=filters["nam_xb"],
+            the_loai=filters["the_loai"],
+            tac_gia=filters["tac_gia"],
+            tinh_trang=filters["tinh_trang"],
+            page=page,
+            page_size=page_size
+        )
+        render_book_page(rows, page, has_more, prefix="admin_search", state_key="admin_search_page")
+
+        if st.button("❌ Xóa bộ lọc và quay lại", key="admin_search_clear"):
+            st.session_state.admin_search_filters = None
+            st.session_state.admin_search_page = 1
+            st.rerun()
 
 def search_logic_user():
     st.subheader("🔍 Bộ lọc tìm kiếm")
-    
+
     c1, c2, c3 = st.columns(3)
     with c1:
         ma = st.text_input("Mã sách", key="search_ma")
@@ -647,18 +742,16 @@ def search_logic_user():
         ten = st.text_input("Tên sách", key="search_ten")
     with c3:
         nam_raw = st.text_input("Năm xuất bản", key="search_nam")
-    
-    c4, c5, c6 = st.columns(3) # Chia làm 3 cột để thêm ô Số lượng
+
+    c4, c5, c6 = st.columns(3)
     with c4:
         tl = st.text_input("Thể loại", key="search_tl")
     with c5:
         tg = st.text_input("Tác giả", key="search_tg")
     with c6:
-        # Thay vì nhập số, ta chọn trạng thái kho sẽ tiện hơn cho Admin/User
-        tinh_trang = st.selectbox("Tình trạng kho", ["Tất cả", "Còn hàng", "Hết hàng"])
+        tinh_trang = st.selectbox("Tình trạng kho", ["Tất cả", "Còn hàng", "Hết hàng"], key="search_tinh_trang")
 
     if st.button("Bắt đầu tìm", width="stretch"):
-        # VALIDATION Năm
         valid = True
         n_val = None
         if nam_raw:
@@ -668,74 +761,212 @@ def search_logic_user():
                     st.error(f"❌ Năm '{nam_raw}' không hợp lệ (0-2026)")
                     valid = False
             except ValueError:
-                st.error(f"❌ Năm phải là số nguyên!")
+                st.error("❌ Năm phải là số nguyên!")
                 valid = False
 
         if valid:
-            res, _ = search_books_advanced(ma, ten, n_val, tl, tg, tinh_trang)
-            if res:
-                st.session_state.search_results = res
-                st.rerun()
-            else:
-                st.session_state.search_results = "EMPTY" # Đánh dấu không tìm thấy
-                st.rerun()
-                
-    # Nút để quay lại xem toàn bộ danh mục (Xóa bộ lọc)
-    if st.session_state.search_results is not None:
-        if st.button("❌ Xóa bộ lọc và quay lại"):
-            st.session_state.search_results = None
+            st.session_state.user_search_filters = {
+                "ma_sach": ma or None,
+                "ten_sach": ten or None,
+                "nam_xb": n_val,
+                "the_loai": tl or None,
+                "tac_gia": tg or None,
+                "tinh_trang": tinh_trang,
+            }
+            st.session_state.user_search_page = 1
             st.rerun()
+
+    if st.session_state.get("user_search_filters"):
+        if st.button("❌ Xóa bộ lọc và quay lại"):
+            st.session_state.user_search_filters = None
+            st.session_state.user_search_page = 1
+            st.rerun()
+
+
+def _chunked(iterable, batch_size):
+    for i in range(0, len(iterable), batch_size):
+        yield iterable[i:i + batch_size]
+
+
+def _neo4j_batch_run(session, query, rows, batch_size=500):
+    if not rows:
+        return
+    for batch in _chunked(rows, batch_size):
+        session.run(query, rows=batch)
 
 
 def sync_all_to_neo4j():
     try:
         with GraphDatabase.driver(neo4j_uri, auth=neo4j_auth) as driver:
             with driver.session() as session:
-                # 1. Xóa sạch để đồng bộ mới
                 session.run("MATCH (n) DETACH DELETE n")
-                
-                # 2. Đồng bộ Danh mục (Category & Author)
+
                 res_tl, _ = execute_oracle("SELECT MA_THE_LOAI, TEN_THE_LOAI FROM THE_LOAI")
-                for row in res_tl: session.run("MERGE (:Category {id: $id, name: $name})", id=row[0], name=row[1])
-                
+                categories = [{"id": row[0], "name": row[1]} for row in res_tl] if res_tl else []
+                _neo4j_batch_run(session, "UNWIND $rows AS row MERGE (c:Category {id: row.id}) SET c.name = row.name", categories)
+
                 res_tg, _ = execute_oracle("SELECT MA_TG, TEN_TG FROM TAC_GIA")
-                for row in res_tg: session.run("MERGE (:Author {id: $id, name: $name})", id=row[0], name=row[1])
+                authors = [{"id": row[0], "name": row[1]} for row in res_tg] if res_tg else []
+                _neo4j_batch_run(session, "UNWIND $rows AS row MERGE (a:Author {id: row.id}) SET a.name = row.name", authors)
 
-                # 3. Đồng bộ Người dùng
                 res_nd, _ = execute_oracle("SELECT MA_DG, USERNAME, HO_TEN FROM NGUOI_DUNG")
-                for row in res_nd: session.run("MERGE (:User {id: $id, username: $un, name: $name})", id=row[0], un=row[1], name=row[2])
+                users = [{"id": row[0], "username": row[1], "name": row[2]} for row in res_nd] if res_nd else []
+                _neo4j_batch_run(session, "UNWIND $rows AS row MERGE (u:User {id: row.id}) SET u.username = row.username, u.name = row.name", users)
 
-                # 4. Đồng bộ Sách & Quan hệ Thể loại
                 res_sach, _ = execute_oracle("SELECT MA_SACH, TEN_SACH, MA_THE_LOAI FROM SACH")
-                for row in res_sach:
-                    session.run("""
-                        MATCH (c:Category {id: $cat_id})
-                        MERGE (b:Book {id: $bid, title: $title})
-                        MERGE (b)-[:BELONGS_TO]->(c)
-                    """, bid=row[0], title=row[1], cat_id=row[2])
+                books = [{"bid": row[0], "title": row[1], "cat_id": row[2]} for row in res_sach] if res_sach else []
+                _neo4j_batch_run(
+                    session,
+                    "UNWIND $rows AS row MERGE (b:Book {id: row.bid}) SET b.title = row.title MERGE (c:Category {id: row.cat_id}) MERGE (b)-[:BELONGS_TO]->(c)",
+                    books
+                )
 
-                # 5. Đồng bộ Quan hệ Tác giả & Phiếu mượn
                 res_stg, _ = execute_oracle("SELECT MA_SACH, MA_TG FROM SACH_TAC_GIA")
-                for row in res_stg: session.run("MATCH (b:Book {id: $bid}), (a:Author {id: $aid}) MERGE (b)-[:WRITTEN_BY]->(a)", bid=row[0], aid=row[1])
-                
-                # res_pm, _ = execute_oracle("SELECT MA_DG, MA_SACH, TRANG_THAI FROM PHIEU_MUON")
-                # for row in res_pm: session.run("MATCH (u:User {id: $uid}), (b:Book {id: $bid}) MERGE (u)-[:BORROWED {status: $st}]->(b)", uid=row[0], bid=row[1], st=row[2])
+                book_authors = [{"bid": row[0], "aid": row[1]} for row in res_stg] if res_stg else []
+                _neo4j_batch_run(
+                    session,
+                    "UNWIND $rows AS row MATCH (b:Book {id: row.bid}), (a:Author {id: row.aid}) MERGE (b)-[:WRITTEN_BY]->(a)",
+                    book_authors
+                )
+
                 res_pm, _ = execute_oracle("SELECT MA_DG, MA_SACH, TRANG_THAI, SO_LUONG_MUON FROM PHIEU_MUON")
-                if res_pm:
-                    for row in res_pm:
-                        session.run("""
-                            MATCH (u:User {id: $uid}), (b:Book {id: $bid})
-                            MERGE (u)-[:BORROWED {status: $st, quantity: $qty}]->(b)
-                        """, uid=row[0], bid=row[1], st=row[2], qty=row[3])
+                borrow_rows = [{"uid": row[0], "bid": row[1], "st": row[2], "qty": row[3]} for row in res_pm] if res_pm else []
+                _neo4j_batch_run(
+                    session,
+                    "UNWIND $rows AS row MATCH (u:User {id: row.uid}), (b:Book {id: row.bid}) MERGE (u)-[r:BORROWED]->(b) SET r.status = row.st, r.quantity = row.qty",
+                    borrow_rows
+                )
         return True
     except Exception as e:
         print(f"Lỗi Sync: {e}")
         return False
 
-# 1. Thêm tham số 'prefix' vào hàm
-def display_book_grid(data, prefix="catalog"):
-    cols = st.columns([1, 2, 1.5, 1.5, 1, 1, 1.2])
-    headers = ["Mã Sách", "Tên Sách", "Thể Loại", "Tác Giả", "Năm", "Kho", "Thao tác"]
+
+def get_neo4j_session():
+    driver = get_neo4j_driver()
+    if not driver:
+        return None
+    try:
+        return driver.session()
+    except Exception as e:
+        print(f"Neo4j session error: {e}")
+        return None
+
+
+def sync_category_node(session, ma_the_loai):
+    res, _ = execute_oracle("SELECT TEN_THE_LOAI FROM THE_LOAI WHERE MA_THE_LOAI = :1", [ma_the_loai])
+    if res:
+        session.run("MERGE (:Category {id: $id, name: $name})", id=ma_the_loai, name=res[0][0])
+
+
+def sync_author_node(session, ma_tg):
+    res, _ = execute_oracle("SELECT TEN_TG FROM TAC_GIA WHERE MA_TG = :1", [ma_tg])
+    if res:
+        session.run("MERGE (:Author {id: $id, name: $name})", id=ma_tg, name=res[0][0])
+
+
+def sync_user_node(ma_dg):
+    session = get_neo4j_session()
+    if not session:
+        return False
+    res, _ = execute_oracle("SELECT USERNAME, HO_TEN, SO_DIEN_THOAI, TRANG_THAI FROM NGUOI_DUNG WHERE MA_DG = :1", [ma_dg])
+    if not res:
+        return False
+    username, ho_ten, phone, trang_thai = res[0]
+    active = 1 if trang_thai == 1 else 0
+    try:
+        with session as s:
+            s.run(
+                "MERGE (u:User {id: $id}) SET u.username = $username, u.name = $name, u.phone = $phone, u.active = $active",
+                id=ma_dg, username=username, name=ho_ten, phone=phone, active=active
+            )
+        return True
+    except Exception as e:
+        print(f"Lỗi sync user Neo4j: {e}")
+        return False
+
+
+def sync_book_node(ma_sach):
+    session = get_neo4j_session()
+    if not session:
+        return False
+    res, _ = execute_oracle(
+        "SELECT TEN_SACH, MA_THE_LOAI, NAM_XB, SO_LUONG FROM SACH WHERE MA_SACH = :1", [ma_sach]
+    )
+    if not res:
+        remove_book_from_neo4j(ma_sach)
+        return False
+    title, ma_the_loai, nam_xb, so_luong = res[0]
+    try:
+        with session as s:
+            sync_category_node(s, ma_the_loai)
+            s.run(
+                "MERGE (b:Book {id: $id}) SET b.title = $title, b.year = $year, b.stock = $stock",
+                id=ma_sach, title=title, year=nam_xb, stock=so_luong
+            )
+            s.run("MATCH (b:Book {id: $id})-[r:WRITTEN_BY]->() DELETE r", id=ma_sach)
+            res_auth, _ = execute_oracle("SELECT MA_TG FROM SACH_TAC_GIA WHERE MA_SACH = :1", [ma_sach])
+            if res_auth:
+                for auth_row in res_auth:
+                    ma_tg = auth_row[0]
+                    sync_author_node(s, ma_tg)
+                    s.run(
+                        "MATCH (b:Book {id: $bid}), (a:Author {id: $aid}) MERGE (b)-[:WRITTEN_BY]->(a)",
+                        bid=ma_sach, aid=ma_tg
+                    )
+            s.run(
+                "MATCH (b:Book {id: $bid}), (c:Category {id: $cid}) MERGE (b)-[:BELONGS_TO]->(c)",
+                bid=ma_sach, cid=ma_the_loai
+            )
+        return True
+    except Exception as e:
+        print(f"Lỗi sync book Neo4j: {e}")
+        return False
+
+
+def remove_book_from_neo4j(ma_sach):
+    session = get_neo4j_session()
+    if not session:
+        return False
+    try:
+        with session as s:
+            s.run("MATCH (b:Book {id: $id}) DETACH DELETE b", id=ma_sach)
+        return True
+    except Exception as e:
+        print(f"Lỗi xóa sách trên Neo4j: {e}")
+        return False
+
+
+def sync_borrow_record(ma_pm):
+    session = get_neo4j_session()
+    if not session:
+        return False
+    res, _ = execute_oracle(
+        "SELECT MA_DG, MA_SACH, TRANG_THAI, SO_LUONG_MUON FROM PHIEU_MUON WHERE MA_PM = :1", [ma_pm]
+    )
+    if not res:
+        return False
+    ma_dg, ma_sach, trang_thai, so_luong_muon = res[0]
+    try:
+        with session as s:
+            s.run(
+                "MATCH (u:User {id: $uid}), (b:Book {id: $bid}) MERGE (u)-[r:BORROWED]->(b) SET r.status = $status, r.quantity = $qty",
+                uid=ma_dg, bid=ma_sach, status=trang_thai, qty=so_luong_muon
+            )
+        return True
+    except Exception as e:
+        print(f"Lỗi sync borrow Neo4j: {e}")
+        return False
+
+# 1. Thêm tham số 'prefix' và 'show_borrow_button' vào hàm
+def display_book_grid(data, prefix="catalog", show_borrow_button=True):
+    if show_borrow_button:
+        cols = st.columns([1, 2, 1.5, 1.5, 1, 1, 1.2])
+        headers = ["Mã Sách", "Tên Sách", "Thể Loại", "Tác Giả", "Năm", "Kho", "Thao tác"]
+    else:
+        cols = st.columns([1, 2, 1.5, 1.5, 1, 1])
+        headers = ["Mã Sách", "Tên Sách", "Thể Loại", "Tác Giả", "Năm", "Kho"]
+    
     for col, header in zip(cols, headers):
         col.markdown(f"**{header}**")
     st.divider()
@@ -743,7 +974,11 @@ def display_book_grid(data, prefix="catalog"):
     # 2. Dùng enumerate để lấy thêm số thứ tự (idx) của từng dòng
     for idx, row in enumerate(data):
         ma_sach, ten_sach, the_loai, tac_gia, nam_xb, so_luong = row
-        c1, c2, c3, c4, c5, c6, c7 = st.columns([1, 2, 1.5, 1.5, 1, 1, 1.2])
+        
+        if show_borrow_button:
+            c1, c2, c3, c4, c5, c6, c7 = st.columns([1, 2, 1.5, 1.5, 1, 1, 1.2])
+        else:
+            c1, c2, c3, c4, c5, c6 = st.columns([1, 2, 1.5, 1.5, 1, 1])
         
         c1.text(ma_sach)
         c2.text(ten_sach)
@@ -756,21 +991,34 @@ def display_book_grid(data, prefix="catalog"):
         else:
             c6.text(so_luong)
 
-        is_disabled = (so_luong == 0)
-        
-        # 3. CẬP NHẬT KEY DUY NHẤT: Thêm prefix và idx vào key
-        # Ví dụ: borrow_search_S002_0, borrow_catalog_S002_1...
-        unique_key = f"borrow_{prefix}_{ma_sach}_{idx}"
-        
-        if c7.button("📖 Mượn", key=unique_key, disabled=is_disabled, use_container_width=True):
-            st.session_state.page = "borrow_detail"
-            st.session_state.borrow_book_id = ma_sach
-            st.session_state.borrow_book_name = ten_sach
-            st.session_state.borrow_book_stock = so_luong
-            st.rerun()
+        if show_borrow_button:
+            is_disabled = (so_luong == 0)
+            
+            # 3. CẬP NHẬT KEY DUY NHẤT: Thêm prefix và idx vào key
+            # Ví dụ: borrow_search_S002_0, borrow_catalog_S002_1...
+            unique_key = f"borrow_{prefix}_{ma_sach}_{idx}"
+            
+            if c7.button("📖 Mượn", key=unique_key, disabled=is_disabled, use_container_width=True):
+                st.session_state.page = "borrow_detail"
+                st.session_state.borrow_book_id = ma_sach
+                st.session_state.borrow_book_name = ten_sach
+                st.session_state.borrow_book_stock = so_luong
+                st.rerun()
 
-if 'search_results' not in st.session_state:
-    st.session_state.search_results = None  # Lưu dữ liệu tìm được
+if 'user_catalog_page' not in st.session_state:
+    st.session_state.user_catalog_page = 1
+if 'user_search_page' not in st.session_state:
+    st.session_state.user_search_page = 1
+if 'admin_manage_page' not in st.session_state:
+    st.session_state.admin_manage_page = 1
+if 'admin_search_page' not in st.session_state:
+    st.session_state.admin_search_page = 1
+if 'admin_user_page' not in st.session_state:
+    st.session_state.admin_user_page = 1
+if 'admin_loan_page' not in st.session_state:
+    st.session_state.admin_loan_page = 1
+if 'user_history_page' not in st.session_state:
+    st.session_state.user_history_page = 1
 if 'page' not in st.session_state:
     st.session_state.page = "catalog" # Mặc định là trang danh mục
 if 'borrow_book_id' not in st.session_state:
@@ -784,8 +1032,7 @@ if 'logged_in' not in st.session_state:
     st.session_state.role = None
     st.session_state.user_name = ""
 
-# --- MÀN HÌNH ĐĂNG NHẬP ---
-if not st.session_state.logged_in:
+def render_login_page():
     st.title("📚 Thư viện")
     tab_login, tab_reg = st.tabs(["🔑 Đăng nhập", "📝 Đăng ký User"])
 
@@ -795,25 +1042,19 @@ if not st.session_state.logged_in:
             u = st.text_input("Username")
             p = st.text_input("Password", type="password")
             if st.button("Đăng nhập"):
-                # 1. Thêm TRANG_THAI vào câu lệnh SELECT
                 sql = "SELECT MA_DG, HO_TEN, TRANG_THAI FROM NGUOI_DUNG WHERE USERNAME = :1 AND PASSWORD = :2"
                 res, _ = execute_oracle(sql, [u, p])
-                
                 if res:
-                    # Lấy dữ liệu từ kết quả truy vấn
                     ma_dg, ho_ten, trang_thai = res[0]
-                    
-                    # 2. Kiểm tra trạng thái tài khoản
-                    # Giả định: 1 là hoạt động, 0 là bị khóa
                     if trang_thai == 1:
                         st.session_state.logged_in = True
                         st.session_state.role = "USER"
                         st.session_state.user_id = ma_dg
                         st.session_state.user_name = ho_ten
+                        st.session_state.page = "catalog"
                         st.success(f"Chào mừng {ho_ten} quay trở lại!")
                         st.rerun()
                     else:
-                        # Hiển thị thông báo nếu trạng thái = 0
                         st.error("⚠️ Tài khoản của bạn đã bị khóa. Vui lòng liên hệ Thủ thư để được hỗ trợ!")
                 else:
                     st.error("Tài khoản hoặc mật khẩu không đúng!")
@@ -824,49 +1065,37 @@ if not st.session_state.logged_in:
                     st.session_state.logged_in = True
                     st.session_state.role = "ADMIN"
                     st.session_state.user_name = "Quản trị viên"
+                    st.session_state.page = "catalog"
                     st.rerun()
                 else:
                     st.error("Mã Admin không chính xác!")
-    
+
     with tab_reg:
         st.subheader("Tạo tài khoản mới")
         new_u = st.text_input("Username mới")
         new_p = st.text_input("Password mới", type="password")
-
         new_name = st.text_input("Họ tên")
         new_phone = st.text_input("Số điện thoại")
-        
+
         if st.button("Hoàn tất đăng ký", width="stretch"):
             if new_u and new_p and new_name:
-                # 1. Tự động tạo mã độc giả
                 new_ma_dg = get_next_id("NGUOI_DUNG", "MA_DG", "DG")
-                
-                # 2. Lưu vào Oracle
                 sql = "INSERT INTO NGUOI_DUNG (MA_DG, USERNAME, PASSWORD, HO_TEN, SO_DIEN_THOAI) VALUES (:1, :2, :3, :4, :5)"
                 success, err = execute_oracle(sql, [new_ma_dg, new_u, new_p, new_name, new_phone], is_select=False)
-                
                 if success:
-                    # 3. ĐỒNG BỘ TỰ ĐỘNG SANG NEO4J
-                    try:
-                        with GraphDatabase.driver(neo4j_uri, auth=neo4j_auth) as driver:
-                            with driver.session() as session:
-                                session.run("""
-                                    MERGE (u:User {id: $id})
-                                    SET u.username = $username, 
-                                        u.fullName = $name, 
-                                        u.phone = $phone
-                                """, id=new_ma_dg, username=new_u, name=new_name, phone=new_phone)
-                        
-                        st.balloons() # Hiệu ứng chúc mừng
+                    if sync_user_node(new_ma_dg):
+                        st.balloons()
                         st.success(f"Đăng ký thành công! Mã của bạn là: {new_ma_dg}")
                         st.info("Tài khoản đã được đồng bộ vào hệ thống gợi ý Graph.")
-                    except Exception as neo_err:
-                        # Nếu lỗi Neo4j, vẫn báo đăng ký thành công Oracle nhưng cảnh báo phần Sync
-                        st.warning(f"Đăng ký thành công nhưng lỗi đồng bộ Graph: {neo_err}")
+                    else:
+                        st.warning("Đăng ký thành công nhưng không thể đồng bộ vào Neo4j.")
                 else:
                     st.error(f"Lỗi Oracle: {err}")
             else:
                 st.warning("Vui lòng điền đầy đủ các thông tin bắt buộc!")
+
+if not st.session_state.get('logged_in', False):
+    render_login_page()
     st.stop()
 
 # --- MÀN HÌNH SAU KHI ĐĂNG NHẬP ---
@@ -881,6 +1110,8 @@ with st.sidebar:
     if st.button("🚪 Đăng xuất"):
         st.session_state.logged_in = False
         st.session_state.role = None
+        st.session_state.user_name = ""
+        st.session_state.user_id = None
         st.rerun()
 
     if st.session_state.role == "ADMIN":
@@ -895,14 +1126,14 @@ with st.sidebar:
             
             if st.button("🔥 XÁC NHẬN XÓA TẤT CẢ", width="stretch"):
                 if confirm_code == ADMIN_SECRET_KEY:
-                    # Thứ tự xóa để tránh lỗi Constraint (Khóa ngoại)
+                    # Thứ tự xóa để tránh lỗi Constraint (Khóa ngoại) - dùng TRUNCATE cho tốc độ cao
                     queries = [
-                        "DELETE FROM PHIEU_MUON",
-                        "DELETE FROM SACH_TAC_GIA",
-                        "DELETE FROM SACH",
-                        "DELETE FROM THE_LOAI",
-                        "DELETE FROM TAC_GIA",
-                        "DELETE FROM NGUOI_DUNG"
+                        "TRUNCATE TABLE PHIEU_MUON",
+                        "TRUNCATE TABLE SACH_TAC_GIA",
+                        "TRUNCATE TABLE SACH",
+                        "TRUNCATE TABLE THE_LOAI",
+                        "TRUNCATE TABLE TAC_GIA",
+                        "TRUNCATE TABLE NGUOI_DUNG"
                     ]
                     
                     success_all = True
@@ -913,18 +1144,24 @@ with st.sidebar:
                             success_all = False
                             break
                     
-                    # if success_all:
-                    #     # Xóa trắng Neo4j
-                    #     try:
-                    #         with GraphDatabase.driver(neo4j_uri, auth=neo4j_auth) as driver:
-                    #             with driver.session() as session:
-                    #                 session.run("MATCH (n) DETACH DELETE n")
-                    #         st.success("Dữ liệu đã được làm sạch!")
-                    #         st.rerun()
-                    #     except Exception as e:
-                    #         st.error(f"Lỗi Neo4j: {e}")
+                    if success_all:
+                        # Xóa trắng Neo4j nhanh hơn bằng batch delete từng loại node
+                        try:
+                            with GraphDatabase.driver(neo4j_uri, auth=neo4j_auth) as driver:
+                                with driver.session() as session:
+                                    # Xóa relationships trước
+                                    session.run("MATCH ()-[r]-() DELETE r")
+                                    # Xóa nodes theo loại
+                                    session.run("MATCH (n:Book) DELETE n")
+                                    session.run("MATCH (n:User) DELETE n")
+                                    session.run("MATCH (n:Category) DELETE n")
+                                    session.run("MATCH (n:Author) DELETE n")
+                            st.success("Dữ liệu đã được làm sạch!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Lỗi Neo4j: {e}")
                     
-                    st.success("Dữ liệu đã được làm sạch!")
+                    # st.success("Dữ liệu đã được làm sạch!")
                     #st.rerun()
                 else:
                     st.error("Mã Admin không đúng!")
@@ -989,6 +1226,7 @@ if st.session_state.role == "ADMIN":
                         
                         if success:
                             st.success(f"Đã cập nhật! Mã {ma_sach_ton_tai} tăng thêm {b_qty} cuốn.")
+                            sync_book_node(ma_sach_ton_tai)
                     else:
                         # TRƯỜNG HỢP 2: Sách mới hoàn toàn -> Chèn mới với số lượng đã nhập
                         new_id = get_next_id("SACH", "MA_SACH", "S")
@@ -1000,6 +1238,7 @@ if st.session_state.role == "ADMIN":
                         
                         if success_b:
                             st.success(f"Thêm mới thành công! Mã sách: {new_id} với số lượng: {b_qty}")
+                            sync_book_node(new_id)
                 else:
                     st.warning("Vui lòng nhập đầy đủ tên sách, thể loại và tác giả!")
                         
@@ -1007,95 +1246,117 @@ if st.session_state.role == "ADMIN":
         st.divider()
         st.subheader("📋 Chỉnh sửa / Xóa sách toàn diện")
 
-        # 1. Lấy danh sách sách đầy đủ thông tin (Thêm cột SO_LUONG)
-        sql_fetch_all = """
-            SELECT 
-                s.MA_SACH, 
-                s.TEN_SACH, 
-                t.TEN_THE_LOAI, 
-                LISTAGG(tg.TEN_TG, ', ') WITHIN GROUP (ORDER BY tg.TEN_TG) AS TAC_GIA,
-                s.NAM_XB,
-                s.SO_LUONG
-            FROM SACH s
-            JOIN THE_LOAI t ON s.MA_THE_LOAI = t.MA_THE_LOAI
-            LEFT JOIN SACH_TAC_GIA stg ON s.MA_SACH = stg.MA_SACH
-            LEFT JOIN TAC_GIA tg ON stg.MA_TG = tg.MA_TG
-            GROUP BY s.MA_SACH, s.TEN_SACH, t.TEN_THE_LOAI, s.NAM_XB, s.SO_LUONG
-            ORDER BY s.MA_SACH
-        """
-        res_manage, _ = execute_oracle(sql_fetch_all)
-
+        # 1. Bộ lọc tìm kiếm sách theo tên
+        col_search, col_clear = st.columns([4, 1])
+        with col_search:
+            search_book = st.text_input("🔍 Tìm sách theo tên (VD: Python):", key="admin_search_book")
+        with col_clear:
+            if st.button("🔄 Xóa lọc", key="btn_clear_search"):
+                st.session_state.admin_search_book = ""
+                st.session_state.selected_book_id = None
+                st.rerun()
+        
+        # 2. Lấy danh sách sách theo tìm kiếm bằng tên
+        selected_id = None
+        if search_book:
+            res_manage, _ = query_books_page(page=1, page_size=10, ten_sach=search_book)
+        else:
+            # Nếu không tìm kiếm, chỉ lấy 10 sách đầu tiên (như cũ)
+            res_manage, _ = query_books_page(page=1, page_size=10)
+            
         if res_manage:
             book_dict = {
                 row[0]: {
                     'name': row[1],
                     'cat': row[2],
-                    'auth': row[3],
+                    'auth': row[3] if row[3] else "N/A",
                     'year': row[4],
                     'qty': row[5]
                 } for row in res_manage
             }
             
-            selected_id = st.selectbox("Chọn mã sách cần xử lý:", options=list(book_dict.keys()))
-            current_book = book_dict[selected_id]
+            # Format options cho selectbox: "MA_SACH - Tên sách"
+            book_options = [f"{bid} - {info['name'][:40]}" for bid, info in book_dict.items()]
+            selected_option = st.selectbox(
+                "Chọn mã sách cần xử lý:",
+                options=book_options,
+                key="admin_edit_selectbox"
+            )
+            # Lấy mã sách từ option được chọn (phần trước dấu " - ")
+            selected_id = selected_option.split(" - ")[0] if selected_option else None
+            
+            if selected_id and selected_id in book_dict:
+                current_book = book_dict[selected_id]
 
-            with st.form("comprehensive_edit_form"):
-                st.info(f"Đang xử lý mã sách: **{selected_id}**")
-                
-                edit_name = st.text_input("Tên sách:", value=current_book['name'])
-                edit_cat = st.text_input("Thể loại:", value=current_book['cat'])
-                edit_auth = st.text_input("Tác giả:", value=current_book['auth'])
-                
-                # Dùng text_input cho Năm và Số lượng để xử lý lỗi nhập liệu linh hoạt
-                edit_year_raw = st.text_input("Năm xuất bản:", value=str(current_book['year']))
-                edit_qty_raw = st.text_input("Số lượng trong kho:", value=str(current_book['qty']))
-                
-                col_edit, col_del = st.columns(2)
-                with col_edit:
-                    submit_update = st.form_submit_button("💾 Cập nhật thay đổi")
-                with col_del:
-                    submit_delete = st.form_submit_button("🗑️ Xóa sách khỏi hệ thống")
-
-                # --- XỬ LÝ CẬP NHẬT ---
-                if submit_update:
-                    # VALIDATION: Kiểm tra Năm xuất bản
-                    try:
-                        final_year = int(edit_year_raw)
-                        if final_year < 0 or final_year > 2026: # Giả sử năm hiện tại là 2026
-                            final_year = current_book['year'] # Không hợp lệ thì giữ nguyên
-                    except ValueError:
-                        final_year = current_book['year']
-
-                    # VALIDATION: Kiểm tra Số lượng
-                    try:
-                        final_qty = int(edit_qty_raw)
-                        if final_qty < 0: # Chấp nhận bằng 0, nhưng không chấp nhận âm
-                            final_qty = current_book['qty'] # Không hợp lệ thì giữ nguyên
-                    except ValueError:
-                        final_qty = current_book['qty']
-
-                    # 1. Xử lý Metadata
-                    new_ma_tl = get_or_create_metadata("THE_LOAI", "TL", edit_cat)
-                    new_ma_tg = get_or_create_metadata("TAC_GIA", "TG", edit_auth)
+                with st.form("comprehensive_edit_form"):
+                    st.info(f"Đang xử lý mã sách: **{selected_id}**")
                     
-                    # 2. Cập nhật bảng SACH (Thêm SO_LUONG)
-                    sql_up_sach = "UPDATE SACH SET TEN_SACH = :1, NAM_XB = :2, MA_THE_LOAI = :3, SO_LUONG = :4 WHERE MA_SACH = :5"
-                    execute_oracle(sql_up_sach, [edit_name, final_year, new_ma_tl, final_qty, selected_id], is_select=False)
+                    edit_name = st.text_input("Tên sách:", value=current_book['name'])
+                    edit_cat = st.text_input("Thể loại:", value=current_book['cat'])
+                    edit_auth = st.text_input("Tác giả:", value=current_book['auth'])
                     
-                    # 3. Cập nhật bảng trung gian Tác giả
-                    execute_oracle("DELETE FROM SACH_TAC_GIA WHERE MA_SACH = :1", [selected_id], is_select=False)
-                    execute_oracle("INSERT INTO SACH_TAC_GIA (MA_SACH, MA_TG) VALUES (:1, :2)", [selected_id, new_ma_tg], is_select=False)
+                    # Dùng text_input cho Năm và Số lượng để xử lý lỗi nhập liệu linh hoạt
+                    edit_year_raw = st.text_input("Năm xuất bản:", value=str(current_book['year']))
+                    edit_qty_raw = st.text_input("Số lượng trong kho:", value=str(current_book['qty']))
                     
-                    st.success(f"Đã cập nhật sách {selected_id}. (Năm: {final_year}, SL: {final_qty})")
-                    st.rerun()
+                    col_edit, col_del = st.columns(2)
+                    with col_edit:
+                        submit_update = st.form_submit_button("💾 Cập nhật thay đổi")
+                    with col_del:
+                        submit_delete = st.form_submit_button("🗑️ Xóa sách khỏi hệ thống")
 
-                # --- XỬ LÝ XÓA ---
-                if submit_delete:
-                    # Lưu ý: Xóa sách ở đây là xóa hẳn bản ghi đầu mục, không phụ thuộc vào số lượng
-                    execute_oracle("DELETE FROM SACH_TAC_GIA WHERE MA_SACH = :1", [selected_id], is_select=False)
-                    execute_oracle("DELETE FROM SACH WHERE MA_SACH = :1", [selected_id], is_select=False)
-                    st.warning(f"Đã xóa hoàn toàn sách {selected_id} khỏi cơ sở dữ liệu!")
-                    st.rerun()
+                    # --- XỬ LÝ CẬP NHẬT ---
+                    if submit_update:
+                        # VALIDATION: Kiểm tra Năm xuất bản
+                        try:
+                            final_year = int(edit_year_raw)
+                            if final_year < 0 or final_year > 2026: # Giả sử năm hiện tại là 2026
+                                final_year = current_book['year'] # Không hợp lệ thì giữ nguyên
+                        except ValueError:
+                            final_year = current_book['year']
+
+                        # VALIDATION: Kiểm tra Số lượng
+                        try:
+                            final_qty = int(edit_qty_raw)
+                            if final_qty < 0: # Chấp nhận bằng 0, nhưng không chấp nhận âm
+                                final_qty = current_book['qty'] # Không hợp lệ thì giữ nguyên
+                        except ValueError:
+                            final_qty = current_book['qty']
+
+                        # 1. Xử lý Metadata
+                        new_ma_tl = get_or_create_metadata("THE_LOAI", "TL", edit_cat)
+                        new_ma_tg = get_or_create_metadata("TAC_GIA", "TG", edit_auth)
+                        
+                        # 2. Cập nhật bảng SACH (Thêm SO_LUONG)
+                        sql_up_sach = "UPDATE SACH SET TEN_SACH = :1, NAM_XB = :2, MA_THE_LOAI = :3, SO_LUONG = :4 WHERE MA_SACH = :5"
+                        execute_oracle(sql_up_sach, [edit_name, final_year, new_ma_tl, final_qty, selected_id], is_select=False)
+                        
+                        # 3. Cập nhật bảng trung gian Tác giả
+                        execute_oracle("DELETE FROM SACH_TAC_GIA WHERE MA_SACH = :1", [selected_id], is_select=False)
+                        execute_oracle("INSERT INTO SACH_TAC_GIA (MA_SACH, MA_TG) VALUES (:1, :2)", [selected_id, new_ma_tg], is_select=False)
+                        
+                        st.success(f"Đã cập nhật sách {selected_id}. (Năm: {final_year}, SL: {final_qty})")
+                        sync_book_node(selected_id)
+                        st.rerun()
+
+                    # --- XỬ LÝ XÓA ---
+                    if submit_delete:
+                        # Xóa theo thứ tự tránh lỗi Foreign Key Constraint:
+                        # 1. Xóa các phiếu mượn
+                        del_pm, err_pm = execute_oracle("DELETE FROM PHIEU_MUON WHERE MA_SACH = :1", [selected_id], is_select=False)
+                        
+                        # 2. Xóa tác giả liên kết
+                        del_stg, err_stg = execute_oracle("DELETE FROM SACH_TAC_GIA WHERE MA_SACH = :1", [selected_id], is_select=False)
+                        
+                        # 3. Xóa sách
+                        del_sach, err_sach = execute_oracle("DELETE FROM SACH WHERE MA_SACH = :1", [selected_id], is_select=False)
+                        
+                        if del_pm and del_stg and del_sach:
+                            remove_book_from_neo4j(selected_id)
+                            st.success(f"✅ Đã xóa hoàn toàn sách {selected_id} khỏi cơ sở dữ liệu!")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Lỗi xóa sách: {err_pm or err_stg or err_sach}")
         else:
             st.info("Chưa có dữ liệu sách để chỉnh sửa.")
     with tab_catalog:
@@ -1109,50 +1370,33 @@ if st.session_state.role == "ADMIN":
     with tab_loan:
         display_borrow_management()
 
-else: # USER ROLE
+elif st.session_state.role == "USER":
     tab_main, tab_graph, tab_history_loan = st.tabs(["📚 Thư viện sách", "💡 Gợi ý cho bạn", "📖 Lịch sử mượn"])
     with tab_main:
         
         # Màn hình chính của Độc giả
         if st.session_state.page == "catalog":
-            # Gọi hàm hiển thị thanh tìm kiếm
-            # display_comprehensive_catalog_user()
-            # st.divider()
-            # search_logic_user()
             search_logic_user() # Luôn hiện bộ lọc ở trên cùng
 
             st.divider() # Vạch kẻ phân cách
 
-            # Logic điều hướng bảng:
-            if st.session_state.search_results is None:
-                # TRƯỜNG HỢP 1: Chưa tìm kiếm -> Hiện danh mục mặc định
-                st.subheader("📋 Danh mục sách chi tiết")
-                sql_all = """
-                    SELECT s.MA_SACH, s.TEN_SACH, t.TEN_THE_LOAI, 
-                        LISTAGG(tg.TEN_TG, ', ') WITHIN GROUP (ORDER BY tg.TEN_TG),
-                        s.NAM_XB, s.SO_LUONG
-                    FROM SACH s
-                    JOIN THE_LOAI t ON s.MA_THE_LOAI = t.MA_THE_LOAI
-                    LEFT JOIN SACH_TAC_GIA stg ON s.MA_SACH = stg.MA_SACH
-                    LEFT JOIN TAC_GIA tg ON stg.MA_TG = tg.MA_TG
-                    GROUP BY s.MA_SACH, s.TEN_SACH, t.TEN_THE_LOAI, s.NAM_XB, s.SO_LUONG
-                    ORDER BY s.MA_SACH
-                """
-                data_all, _ = execute_oracle(sql_all)
-                if data_all:
-                    display_book_grid(data_all, prefix="main_catalog")
-
-            elif st.session_state.search_results == "EMPTY":
-                # TRƯỜNG HỢP 2: Đã tìm nhưng không có kết quả
-                st.info("⚠️ Không tìm thấy kết quả phù hợp với bộ lọc của bạn.")
-
-            else:
-                # TRƯỜNG HỢP 3: Có kết quả tìm kiếm -> Chỉ hiện bảng này
+            filters = st.session_state.get("user_search_filters")
+            if filters:
                 st.subheader("🎯 Kết quả tìm kiếm phù hợp")
-                display_book_grid(st.session_state.search_results, prefix="search_res")
-                        # Gọi hàm hiển thị danh mục mặc định nếu không tìm kiếm
-                        # data, _ = execute_oracle("SELECT ...")
-                        # display_book_grid(data)
+                st.session_state.user_search_page = st.session_state.get("user_search_page", 1)
+                page_size = PAGE_SIZE_SEARCH_ALL if is_search_all(filters) else PAGE_SIZE_DEFAULT
+                rows, has_more = query_books_page(page=st.session_state.user_search_page,
+                                                  page_size=page_size,
+                                                  **filters)
+                render_book_page(rows, st.session_state.user_search_page, has_more,
+                                 prefix="search_res", state_key="user_search_page")
+            else:
+                st.subheader("📋 Danh mục sách chi tiết")
+                if 'user_catalog_page' not in st.session_state:
+                    st.session_state.user_catalog_page = 1
+                rows, has_more = query_books_page(page=st.session_state.user_catalog_page, page_size=PAGE_SIZE_DEFAULT)
+                render_book_page(rows, st.session_state.user_catalog_page, has_more,
+                                 prefix="main_catalog", state_key="user_catalog_page")
         elif st.session_state.page == "borrow_detail":
             borrow_book_page()
     with tab_graph:
